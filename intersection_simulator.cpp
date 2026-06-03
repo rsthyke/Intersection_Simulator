@@ -173,3 +173,159 @@ public:
     }
 
 #ifdef _WIN32
+    void paint(HDC hdc, int W, int H) {
+        std::lock_guard<std::mutex> lk(mtx);
+
+        RECT full{ 0, 0, W, H };
+        HBRUSH bg = CreateSolidBrush(RGB(232, 238, 230));
+        FillRect(hdc, &full, bg);
+        DeleteObject(bg);
+        SetBkMode(hdc, TRANSPARENT);
+
+        HFONT fHead = CreateFontA(20, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                   OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                   DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+        HFONT fSmall = CreateFontA(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                    OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                    DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+        HFONT fTiny = CreateFontA(11, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                   OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                   DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+        HFONT oldFont = (HFONT)SelectObject(hdc, fSmall);
+
+        const int cx0  = W / 2 - 70;
+        const int cy0  = H / 2 + 20;
+        const int box  = 86;
+        const int half = 28;
+        const int lane = 13;
+        int vArm = (H - 170) / 2; if (vArm < 110) vArm = 110;
+        int hArm = (W - 360) / 2; if (hArm < 160) hArm = 160;
+        COLORREF roadCol = RGB(74, 78, 84);
+
+        // roads
+        { RECT v{ cx0 - half, cy0 - vArm, cx0 + half, cy0 + vArm };
+          HBRUSH b = CreateSolidBrush(roadCol); FillRect(hdc, &v, b); DeleteObject(b); }
+        { RECT h{ cx0 - hArm, cy0 - half, cx0 + hArm, cy0 + half };
+          HBRUSH b = CreateSolidBrush(roadCol); FillRect(hdc, &h, b); DeleteObject(b); }
+
+        // dashed centre lines (skip the box)
+        {
+            HPEN dash = CreatePen(PS_SOLID, 2, RGB(245, 210, 70));
+            HPEN oldp = (HPEN)SelectObject(hdc, dash);
+            for (int y = cy0 - vArm; y < cy0 + vArm; y += 26) {
+                if (y > cy0 - box / 2 - 6 && y < cy0 + box / 2 + 6) continue;
+                MoveToEx(hdc, cx0, y, nullptr); LineTo(hdc, cx0, y + 13);
+            }
+            for (int x = cx0 - hArm; x < cx0 + hArm; x += 26) {
+                if (x > cx0 - box / 2 - 6 && x < cx0 + box / 2 + 6) continue;
+                MoveToEx(hdc, x, cy0, nullptr); LineTo(hdc, x + 13, cy0);
+            }
+            SelectObject(hdc, oldp);
+            DeleteObject(dash);
+        }
+
+        // the junction box (red when a car is crossing)
+        {
+            bool occ = !occupantName.empty();
+            RECT bx{ cx0 - box / 2, cy0 - box / 2, cx0 + box / 2, cy0 + box / 2 };
+            HBRUSH bb = CreateSolidBrush(occ ? RGB(201, 64, 64) : RGB(96, 100, 106));
+            FillRect(hdc, &bx, bb);
+            DeleteObject(bb);
+            HPEN pen = CreatePen(PS_SOLID, 2, RGB(235, 235, 235));
+            HPEN op  = (HPEN)SelectObject(hdc, pen);
+            HBRUSH ob = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            Rectangle(hdc, bx.left, bx.top, bx.right, bx.bottom);
+            SelectObject(hdc, ob); SelectObject(hdc, op);
+            DeleteObject(pen);
+        }
+
+        // one traffic light on each road (green if that road is green)
+        auto lightAt = [&](int dir, int x, int y) {
+            bool g = (greenDir == dir);
+            HBRUSH b = CreateSolidBrush(g ? RGB(40, 200, 90) : RGB(200, 60, 60));
+            HBRUSH ob = (HBRUSH)SelectObject(hdc, b);
+            HPEN pen = CreatePen(PS_SOLID, 2, RGB(25, 25, 25));
+            HPEN op = (HPEN)SelectObject(hdc, pen);
+            Ellipse(hdc, x - 9, y - 9, x + 9, y + 9);
+            SelectObject(hdc, ob); SelectObject(hdc, op);
+            DeleteObject(b); DeleteObject(pen);
+        };
+        lightAt(0, cx0 + half + 16, cy0 - box / 2 - 14);   // N
+        lightAt(1, cx0 - half - 16, cy0 + box / 2 + 14);   // S
+        lightAt(2, cx0 + box / 2 + 14, cy0 - half - 16);   // E
+        lightAt(3, cx0 - box / 2 - 14, cy0 + half + 16);   // W
+
+        // road names with the number of waiting cars, like "W  (4)"
+        SetTextColor(hdc, RGB(35, 35, 40));
+        auto label = [&](HFONT f, const std::string& s, int x, int y) {
+            SelectObject(hdc, f);
+            SIZE sz; GetTextExtentPoint32A(hdc, s.c_str(), (int)s.size(), &sz);
+            TextOutA(hdc, x - sz.cx / 2, y - sz.cy / 2, s.c_str(), (int)s.size());
+        };
+        const char* dn[4] = { "N", "S", "E", "W" };
+        int lblX[4] = { cx0, cx0, cx0 + hArm + 30, cx0 - hArm - 30 };
+        int lblY[4] = { cy0 - vArm - 20, cy0 + vArm + 20, cy0 - 2, cy0 - 2 };
+        for (int d = 0; d < 4; d++) {
+            std::ostringstream s; s << dn[d] << "  (" << approachWaiting[d] << ")";
+            label(fHead, s.str(), lblX[d], lblY[d]);
+        }
+        label(fSmall, "Inter-A", cx0 - box / 2 - 42, cy0 - box / 2 - 12);
+
+        // ---- vehicles ----
+        auto pointOn = [&](int dir, double s, int& x, int& y, bool& vert) {
+            if (dir == 0)      { vert = true;  x = cx0 + lane; y = (int)((cy0 - vArm) + s * (2.0 * vArm)); }
+            else if (dir == 1) { vert = true;  x = cx0 - lane; y = (int)((cy0 + vArm) - s * (2.0 * vArm)); }
+            else if (dir == 2) { vert = false; y = cy0 - lane; x = (int)((cx0 + hArm) - s * (2.0 * hArm)); }
+            else               { vert = false; y = cy0 + lane; x = (int)((cx0 - hArm) + s * (2.0 * hArm)); }
+        };
+        auto sOf = [](const VLive& v) -> double {
+            if (v.state == VState::DONE) return 0.96;
+            double base, span;
+            if (v.leg == 0) { base = 0.00; span = 0.40; } else { base = 0.52; span = 0.44; }
+            if (v.state == VState::DRIVING) {
+                double frac = std::chrono::duration<double, std::milli>(Clock::now() - v.phaseStart).count()
+                              / (double)v.phaseDur;
+                frac = std::max(0.0, std::min(1.0, frac));
+                return base + frac * span;
+            }
+            if (v.state == VState::QUEUED) return 0.42;     // at the stop line
+            return 0.50;                                    // CROSSING: in the box
+        };
+
+        std::vector<int> qSeen(4, 0), dSeen(4, 0);
+        auto shortId = [](const std::string& name) -> std::string {
+            std::string::size_type p = name.find('-');
+            std::string id = (p == std::string::npos) ? "" : name.substr(p + 1);
+            char c = name.empty() ? '?' : name[0];
+            return std::string(1, c) + id;
+        };
+
+        for (size_t i = 0; i < veh.size(); i++) {
+            const VLive& v = veh[i];
+            COLORREF col = colorFor(v.type);
+            int x, y; bool vert = false;
+            bool highlight = (v.state == VState::CROSSING);
+
+            if (v.state == VState::QUEUED) {
+                int k = qSeen[v.dir]++, gap = 30;
+                if (v.dir == 0)      { vert = true;  x = cx0 + lane; y = cy0 - box / 2 - 10 - k * gap; }
+                else if (v.dir == 1) { vert = true;  x = cx0 - lane; y = cy0 + box / 2 + 10 + k * gap; }
+                else if (v.dir == 2) { vert = false; y = cy0 - lane; x = cx0 + box / 2 + 10 + k * gap; }
+                else                 { vert = false; y = cy0 + lane; x = cx0 - box / 2 - 10 - k * gap; }
+            } else if (v.state == VState::DONE) {
+                double s = 0.96 - dSeen[v.dir]++ * 0.04;
+                pointOn(v.dir, s, x, y, vert);
+                col = RGB((GetRValue(col) + 200) / 2, (GetGValue(col) + 200) / 2, (GetBValue(col) + 200) / 2);
+            } else {
+                pointOn(v.dir, sOf(v), x, y, vert);
+            }
+
+            drawCar(hdc, x, y, col, highlight, vert);
+            SelectObject(hdc, fTiny);
+            SetTextColor(hdc, RGB(20, 20, 20));
+            std::string tag = shortId(v.name);
+            SIZE ts; GetTextExtentPoint32A(hdc, tag.c_str(), (int)tag.size(), &ts);
+            TextOutA(hdc, x - ts.cx / 2, y - ts.cy / 2, tag.c_str(), (int)tag.size());
+            SetTextColor(hdc, RGB(35, 35, 40));
+        }
+

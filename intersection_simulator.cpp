@@ -329,3 +329,122 @@ public:
             SetTextColor(hdc, RGB(35, 35, 40));
         }
 
+        // ---- header ----
+        SelectObject(hdc, fHead);
+        SetTextColor(hdc, RGB(20, 20, 25));
+        double elapsed = std::chrono::duration<double>(Clock::now() - t0).count();
+        std::ostringstream hdrs;
+        hdrs << "Mode: " << (modeStr.empty() ? "(idle)" : modeStr)
+             << "      t = " << std::fixed << std::setprecision(2) << elapsed
+             << " s      Fuel consumed: " << std::setprecision(1) << fuelNow << " L";
+        TextOutA(hdc, 16, 12, hdrs.str().c_str(), (int)hdrs.str().size());
+        SelectObject(hdc, fSmall);
+        SetTextColor(hdc, RGB(70, 70, 78));
+        const char* sub = "Adaptive signal gives GREEN to the road whose waiting traffic wastes the most fuel "
+                          "(trucks first). Keys: [1] Adaptive   [2] Fixed";
+        TextOutA(hdc, 16, 36, sub, (int)strlen(sub));
+
+        // ---- comparison panel (top-right) ----
+        {
+            int px = W - 320, py = 60;
+            SetTextColor(hdc, RGB(35, 35, 40));
+            const char* tt = "TOTAL FUEL CONSUMED";
+            TextOutA(hdc, px, py, tt, (int)strlen(tt));
+            const char* nm[2] = { "Adaptive", "Fixed   " };
+            for (int m = 0; m < 2; m++) {
+                std::ostringstream s;
+                s << nm[m] << ": ";
+                if (haveMode[m]) s << fmt(modeFuel[m]) << " L   (truck wait " << modeTruck[m] << " ms)";
+                else             s << "-- run it --";
+                std::string line = s.str();
+                TextOutA(hdc, px, py + 20 + m * 18, line.c_str(), (int)line.size());
+            }
+            if (haveMode[0] && haveMode[1]) {
+                std::ostringstream s;
+                double save = modeFuel[1] - modeFuel[0];
+                s << "=> Adaptive saves " << fmt(save) << " L of fuel";
+                std::string line = s.str();
+                SetTextColor(hdc, RGB(20, 110, 40));
+                TextOutA(hdc, px, py + 20 + 2 * 18 + 4, line.c_str(), (int)line.size());
+            }
+        }
+
+        // ---- legend (bottom-left) ----
+        SetTextColor(hdc, RGB(35, 35, 40));
+        struct LI { std::string name; COLORREF col; };
+        LI legend[3] = { { "Car", RGB(30,144,255) }, { "Truck", RGB(255,140,0) }, { "Ambulance", RGB(220,20,60) } };
+        int lx = 16, ly = H - 30;
+        for (auto& e : legend) {
+            drawCar(hdc, lx + 13, ly + 7, e.col, false, false);
+            TextOutA(hdc, lx + 32, ly, e.name.c_str(), (int)e.name.size());
+            lx += 32 + (int)e.name.size() * 8 + 28;
+        }
+        {
+            HBRUSH gb = CreateSolidBrush(RGB(40, 200, 90));
+            Ellipse(hdc, lx, ly, lx + 16, ly + 16);
+            HBRUSH ob = (HBRUSH)SelectObject(hdc, gb); SelectObject(hdc, ob); DeleteObject(gb);
+            HBRUSH gb2 = CreateSolidBrush(RGB(40, 200, 90));
+            RECT r1{ lx, ly, lx + 16, ly + 14 }; FillRect(hdc, &r1, gb2); DeleteObject(gb2);
+            TextOutA(hdc, lx + 22, ly, "green", 5); lx += 22 + 5 * 8 + 20;
+            HBRUSH rb = CreateSolidBrush(RGB(200, 60, 60));
+            RECT r2{ lx, ly, lx + 16, ly + 14 }; FillRect(hdc, &r2, rb); DeleteObject(rb);
+            TextOutA(hdc, lx + 22, ly, "red", 3);
+        }
+
+        SelectObject(hdc, oldFont);
+        DeleteObject(fHead);
+        DeleteObject(fSmall);
+        DeleteObject(fTiny);
+    }
+#endif
+};
+
+LiveBoard         live;
+std::atomic<bool> g_closed{false};     // window closed by the user
+std::atomic<int>  g_request{0};        // GUI -> main: 1 = run adaptive, 2 = run fixed
+
+// Vehicle: the base class for all cars.
+class Vehicle {
+protected:
+    int       id;
+    int       x, y;
+    int       speed;
+    double    fuelCost;      // fuel used per second while stopped (L)
+    Direction from;
+    long long wait_ms = 0;
+
+public:
+    Vehicle(int id_, int x_, int y_, int speed_, double fuelCost_, Direction from_)
+        : id(id_), x(x_), y(y_), speed(speed_), fuelCost(fuelCost_), from(from_) {}
+    virtual ~Vehicle() = default;
+
+    virtual void move(int targetX, int targetY) {
+        if      (x < targetX) x += speed;
+        else if (x > targetX) x -= speed;
+        if      (y < targetY) y += speed;
+        else if (y > targetY) y -= speed;
+    }
+
+    // How much fuel this car wastes for each second it waits.
+    // Trucks waste much more, so it is better to not stop them.
+    virtual double calculateFuelLoss() const { return fuelCost; }
+
+    virtual Priority    getPriority() const { return Priority::NORMAL; }
+    virtual std::string getName()     const { return "Car-" + std::to_string(id); }
+    virtual std::string typeName()    const { return "Car"; }
+    virtual int         crossTimeMs() const { return 250; }
+
+    int       getId()     const { return id; }
+    Direction getFrom()   const { return from; }
+    long long getWaitMs() const { return wait_ms; }
+    void      addWaitMs(long long ms) { wait_ms += ms; }
+    void      resetWaitMs()           { wait_ms = 0; }
+};
+
+class Truck : public Vehicle {
+    double loadFactor;
+    double momentumPenalty;
+public:
+    Truck(int id_, int x_, int y_, int speed_, double fuelCost_, Direction from_, double loadFactor_)
+        : Vehicle(id_, x_, y_, speed_, fuelCost_, from_),
+          loadFactor(loadFactor_), momentumPenalty(loadFactor_ * fuelCost_) {}

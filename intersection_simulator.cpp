@@ -448,3 +448,106 @@ public:
     Truck(int id_, int x_, int y_, int speed_, double fuelCost_, Direction from_, double loadFactor_)
         : Vehicle(id_, x_, y_, speed_, fuelCost_, from_),
           loadFactor(loadFactor_), momentumPenalty(loadFactor_ * fuelCost_) {}
+    double      calculateFuelLoss() const override { return momentumPenalty; }
+    Priority    getPriority() const override { return Priority::HIGH; }
+    std::string getName()     const override { return "Truck-" + std::to_string(id); }
+    std::string typeName()    const override { return "Truck"; }
+    int         crossTimeMs() const override { return 600; }
+};
+
+class Ambulance : public Vehicle {
+public:
+    Ambulance(int id_, int x_, int y_, int speed_, double fuelCost_, Direction from_)
+        : Vehicle(id_, x_, y_, speed_, fuelCost_, from_) {}
+    Priority    getPriority() const override { return Priority::EMERGENCY; }
+    std::string getName()     const override { return "Ambulance-" + std::to_string(id); }
+    std::string typeName()    const override { return "Ambulance"; }
+    int         crossTimeMs() const override { return 150; }
+};
+
+// SignalJunction: the four-way junction and its traffic light.
+//
+// A mutex keeps it safe: only one road is green (greenDir) and only one
+// car is in the box at a time. A car waits on the condition variable
+// until its road is green and the box is free, then it crosses. The fuel
+// a car uses = its fuel weight times the seconds it waited at the red
+// light. So less waiting (above all for trucks) means less fuel.
+class SignalJunction {
+    std::mutex              mtx;
+    std::condition_variable cv;
+    int    greenDir = -1;
+    bool   occupied = false;
+    int    waiting[4]      = {0,0,0,0};
+    int    waitEmg[4]      = {0,0,0,0};   // how many ambulances wait on each road
+    double waitFuel[4]     = {0,0,0,0};   // total fuel weight of the cars waiting on each road
+    double fuel_consumed   = 0.0;
+
+public:
+    void reset() {
+        std::lock_guard<std::mutex> lk(mtx);
+        greenDir = -1; occupied = false; fuel_consumed = 0.0;
+        for (int i = 0; i < 4; i++) { waiting[i] = 0; waitEmg[i] = 0; waitFuel[i] = 0.0; }
+    }
+
+    // setGreen(): controller switches the green light to `dir`.
+    void setGreen(int dir) {
+        std::lock_guard<std::mutex> lk(mtx);
+        if (greenDir != dir) { greenDir = dir; live.setGreen(dir); cv.notify_all(); }
+    }
+
+    // Find the road whose waiting cars would waste the most fuel.
+    // Returns -1 if no car waits.
+    int bestDemandDir() {
+        std::lock_guard<std::mutex> lk(mtx);
+        int best = -1; double bestVal = 0.0;
+        for (int d = 0; d < 4; d++) {
+            if (waiting[d] > 0 && waitFuel[d] > bestVal) { bestVal = waitFuel[d]; best = d; }
+        }
+        return best;
+    }
+    // Find a road with a waiting ambulance, or -1. An ambulance gets
+    // green at once, before the fuel rule.
+    int emergencyDir() {
+        std::lock_guard<std::mutex> lk(mtx);
+        for (int d = 0; d < 4; d++) if (waitEmg[d] > 0) return d;
+        return -1;
+    }
+    int  waitingOf(int dir) { std::lock_guard<std::mutex> lk(mtx); return waiting[dir]; }
+    bool busy()             { std::lock_guard<std::mutex> lk(mtx); return occupied; }
+    double getFuelConsumed(){ std::lock_guard<std::mutex> lk(mtx); return fuel_consumed; }
+
+    // A car calls this. It waits until its road is green and the box is
+    // free, adds the fuel it used while waiting, then crosses. It returns
+    // how long it waited.
+    long long cross(Vehicle& v, int dir, int idx) {
+        std::unique_lock<std::mutex> lk(mtx);
+        bool emg = (v.getPriority() == Priority::EMERGENCY);
+        waiting[dir]++;  waitFuel[dir] += v.calculateFuelLoss();  if (emg) waitEmg[dir]++;
+        live.setApproach(dir, waiting[dir]);
+
+        auto t0 = Clock::now();
+        cv.wait(lk, [&] { return greenDir == dir && !occupied; });
+        long long waited = std::chrono::duration_cast<Ms>(Clock::now() - t0).count();
+
+        waiting[dir]--;  waitFuel[dir] -= v.calculateFuelLoss();  if (emg) waitEmg[dir]--;
+        live.setApproach(dir, waiting[dir]);
+        occupied = true;
+        live.setOccupant(v.getName());
+
+        // fuel this car used = its weight x the seconds it waited
+        double consumed = v.calculateFuelLoss() * (waited / 1000.0);
+        fuel_consumed += consumed;
+        live.addFuel(consumed);
+        logLine("[CROSS] " + dirName(dir) + " GREEN -> " + v.getName() +
+                "  waited " + std::to_string(waited) + " ms  (+" + fmt(consumed) + " L)");
+
+        lk.unlock();
+        live.setCrossing(idx, 0);
+        std::this_thread::sleep_for(Ms(v.crossTimeMs()));
+        lk.lock();
+        occupied = false;
+        live.setOccupant("");
+        cv.notify_all();
+        return waited;
+    }
+};

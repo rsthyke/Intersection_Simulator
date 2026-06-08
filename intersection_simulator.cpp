@@ -551,3 +551,62 @@ public:
         return waited;
     }
 };
+
+// controllerLoop(): the traffic light's brain (runs in its own thread).
+//   adaptive == true : give green to the road that wastes the most fuel,
+//                      keep it until that road is empty, then check again.
+//   adaptive == false: give green in a fixed order (N -> S -> E -> W),
+//                      a fixed time each, and do not look at the traffic.
+void controllerLoop(SignalJunction* j, bool adaptive, std::atomic<bool>* stop) {
+    using namespace std::chrono_literals;
+    int rr = 0;
+    while (!stop->load()) {
+        if (adaptive) {
+            // An ambulance gets green first. If none, give green to the
+            // road that wastes the most fuel.
+            int em  = j->emergencyDir();
+            int dir = (em >= 0) ? em : j->bestDemandDir();
+            if (dir < 0) { std::this_thread::sleep_for(40ms); continue; }
+            j->setGreen(dir);
+            auto start = Clock::now();
+            while (!stop->load()) {
+                std::this_thread::sleep_for(50ms);
+                if (j->waitingOf(dir) == 0 && !j->busy()) break;             // road is empty
+                int e2 = j->emergencyDir();
+                if (e2 >= 0 && e2 != dir) break;                             // ambulance on another road
+                if (std::chrono::duration<double>(Clock::now() - start).count() > 6.0) break;
+            }
+        } else {
+            int dir = rr++ % 4;
+            j->setGreen(dir);
+            std::this_thread::sleep_for(1100ms);   // fixed time, ignores the traffic
+        }
+    }
+}
+
+// Vehicle thread: drive to the junction, wait for green, cross, drive out.
+void vehicleThread(Vehicle* v, SignalJunction* j, int idx) {
+    int dir = (int)v->getFrom();
+    // When each car arrives. The trucks come early and together. The cars
+    // come later and spread out. So a fixed light keeps green on empty
+    // roads while the trucks wait.
+    long long travel_ms;
+    switch (v->getPriority()) {
+        case Priority::HIGH:      travel_ms = 70 + (v->getId() * 13) % 90;    break; // trucks come first
+        case Priority::EMERGENCY: travel_ms = 500;                            break; // ambulance
+        default:                  travel_ms = 500 + (v->getId() * 37) % 2200; break; // cars come later
+    }
+    live.setDriving(idx, 0, travel_ms);
+    std::this_thread::sleep_for(Ms(travel_ms));
+
+    live.setQueued(idx, 0);
+    long long waited = j->cross(*v, dir, idx);
+    v->addWaitMs(waited);
+
+    int exit_ms = 140 + (v->getId() * 31) % 220;
+    live.setDriving(idx, 1, exit_ms);
+    std::this_thread::sleep_for(Ms(exit_ms));
+    live.setDone(idx, v->getWaitMs());
+    logLine("[DONE]  " + v->getName() + " finished  total_wait=" +
+            std::to_string(v->getWaitMs()) + " ms");
+}

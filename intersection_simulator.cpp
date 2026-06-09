@@ -610,3 +610,211 @@ void vehicleThread(Vehicle* v, SignalJunction* j, int idx) {
     logLine("[DONE]  " + v->getName() + " finished  total_wait=" +
             std::to_string(v->getWaitMs()) + " ms");
 }
+
+// TrafficGrid: keeps all the cars in one array. This helps the CPU cache
+// when we go over them.
+class TrafficGrid {
+    int width, height;
+    Vehicle** vehicles;
+    int n_veh;
+public:
+    TrafficGrid(int w, int h, int nv) : width(w), height(h), n_veh(nv) {
+        vehicles = new Vehicle*[nv];
+    }
+    ~TrafficGrid() {
+        for (int i = 0; i < n_veh; i++) delete vehicles[i];
+        delete[] vehicles;
+    }
+    void     setVehicle(int i, Vehicle* v) { vehicles[i] = v; }
+    Vehicle& getVehicle(int i)             { return *vehicles[i]; }
+    int      vehicleCount() const          { return n_veh; }
+    void     resetWaitTimes() { for (int i = 0; i < n_veh; i++) vehicles[i]->resetWaitMs(); }
+};
+
+struct SimResult {
+    double    fuel_consumed = 0.0;
+    long long avg_wait_car   = 0;
+    long long avg_wait_truck = 0;
+    long long avg_wait_amb   = 0;
+};
+
+// Simulator: makes the cars, runs one mode, prints the result.
+class Simulator {
+    TrafficGrid*   grid = nullptr;
+    SignalJunction junction;
+    static const int N_VEH = 12;
+
+public:
+    ~Simulator() { delete grid; }
+
+    void initialize() {
+        const int W = 300, H = 100;
+        grid = new TrafficGrid(W, H, N_VEH);
+        // Our test case. Heavy trucks come from the WEST together. Cars come
+        // from the NORTH and EAST, and an ambulance and a car from the SOUTH.
+        // A fixed light wastes green on the empty roads while the trucks
+        // wait. The smart light lets the trucks go first.
+        for (int i = 0; i < N_VEH; i++) {
+            Direction from;
+            if      (i % 3 == 0)                 from = Direction::WEST;   // trucks 0,3,6,9
+            else if (i == 5)                     from = Direction::SOUTH;  // ambulance
+            else if (i == 1 || i == 4 || i == 8) from = Direction::NORTH;  // cars
+            else if (i == 2 || i == 7 || i == 10)from = Direction::EAST;   // cars
+            else                                 from = Direction::SOUTH;  // car 11
+
+            int x = W / 2, y = H / 2;
+            if (i == 5)            grid->setVehicle(i, new Ambulance(i, x, y, 10, 1.5, from));
+            else if (i % 3 == 0) {
+                double loadFactor = (12000 + i * 500) / 12000.0;
+                grid->setVehicle(i, new Truck(i, x, y, 4, 2.5, from, loadFactor));
+            } else                 grid->setVehicle(i, new Vehicle(i, x, y, 8, 0.3, from));
+        }
+    }
+
+    // Run one full pass with the smart light or the fixed light.
+    SimResult runMode(bool adaptive) {
+        std::string mode = adaptive ? "ADAPTIVE" : "FIXED";
+
+        grid->resetWaitTimes();
+        junction.reset();
+
+        std::vector<std::string> names(grid->vehicleCount()), types(grid->vehicleCount());
+        std::vector<int>         dvec(grid->vehicleCount());
+        for (int i = 0; i < grid->vehicleCount(); i++) {
+            Vehicle& v = grid->getVehicle(i);
+            names[i] = v.getName(); types[i] = v.typeName(); dvec[i] = (int)v.getFrom();
+        }
+        live.begin(names, types, dvec, mode);
+
+        printLine("\n" + std::string(56, '='));
+        printLine("  Mode: " + mode + " signal  |  vehicles: " + std::to_string(grid->vehicleCount()));
+        printLine(std::string(56, '='));
+
+        std::atomic<bool> ctlStop{false};
+        std::thread controller(controllerLoop, &junction, adaptive, &ctlStop);
+
+        std::vector<std::thread> threads;
+        threads.reserve(grid->vehicleCount());
+        for (int i = 0; i < grid->vehicleCount(); i++)
+            threads.emplace_back(vehicleThread, &grid->getVehicle(i), &junction, i);
+        for (auto& t : threads) t.join();
+
+        ctlStop = true;
+        controller.join();
+
+        SimResult r;
+        r.fuel_consumed = junction.getFuelConsumed();
+        long long sc = 0, st = 0, sa = 0; int cc = 0, ct = 0, ca = 0;
+        printLine("\n--- Wait Time Summary [" + mode + "] ---");
+        for (int i = 0; i < grid->vehicleCount(); i++) {
+            Vehicle& v = grid->getVehicle(i);
+            std::ostringstream line;
+            line << "  " << std::left << std::setw(14) << v.getName()
+                 << std::setw(11) << v.typeName()
+                 << std::right << std::setw(6) << v.getWaitMs() << " ms";
+            printLine(line.str());
+            switch (v.getPriority()) {
+                case Priority::EMERGENCY: sa += v.getWaitMs(); ca++; break;
+                case Priority::HIGH:      st += v.getWaitMs(); ct++; break;
+                default:                  sc += v.getWaitMs(); cc++; break;
+            }
+        }
+        if (ca) r.avg_wait_amb   = sa / ca;
+        if (ct) r.avg_wait_truck = st / ct;
+        if (cc) r.avg_wait_car   = sc / cc;
+
+        printLine("\n  Avg Ambulance wait : " + std::to_string(r.avg_wait_amb)   + " ms");
+        printLine("  Avg Truck     wait : " + std::to_string(r.avg_wait_truck) + " ms");
+        printLine("  Avg Car       wait : " + std::to_string(r.avg_wait_car)   + " ms");
+        printLine("  Total fuel consumed: " + fmt(r.fuel_consumed)            + " L");
+
+        live.recordMode(adaptive ? 0 : 1, r.fuel_consumed, r.avg_wait_amb, r.avg_wait_truck, r.avg_wait_car);
+        return r;
+    }
+
+    void printStatistics(const SimResult& a, const SimResult& f) const {
+        printLine("\n" + std::string(56, '='));
+        printLine("  FINAL COMPARISON: Adaptive vs Fixed signal");
+        printLine(std::string(56, '-'));
+        printLine("                       Adaptive      Fixed");
+        printLine(std::string(56, '-'));
+        auto row = [](const std::string& lbl, long long av, long long fv, const std::string& u) {
+            std::ostringstream s;
+            s << "  " << std::left << std::setw(22) << lbl
+              << std::right << std::setw(7) << av << " " << u
+              << std::setw(9) << fv << " " << u;
+            return s.str();
+        };
+        printLine(row("Avg ambulance wait", a.avg_wait_amb,   f.avg_wait_amb,   "ms"));
+        printLine(row("Avg truck wait",     a.avg_wait_truck, f.avg_wait_truck, "ms"));
+        printLine(row("Avg car wait",       a.avg_wait_car,   f.avg_wait_car,   "ms"));
+        std::ostringstream fr;
+        fr << "  " << std::left << std::setw(22) << "Fuel consumed"
+           << std::right << std::setw(7) << fmt(a.fuel_consumed) << " L "
+           << std::setw(8) << fmt(f.fuel_consumed) << " L";
+        printLine(fr.str());
+        printLine(std::string(56, '-'));
+        printLine("  Trucks wait " + std::to_string(f.avg_wait_truck - a.avg_wait_truck) +
+                  " ms less with the adaptive signal.");
+        // headline takeaway, stated last
+        printLine("  => Adaptive signal consumes " + fmt(f.fuel_consumed - a.fuel_consumed) +
+                  " L less fuel than the fixed signal.");
+        printLine(std::string(56, '='));
+    }
+};
+
+// Win32 window code: draws the live view and reads the keys.
+#ifdef _WIN32
+HWND g_hwnd = nullptr;
+
+bool saveBoardBmp(const char* path, int W, int H) {
+    if (W <= 0 || H <= 0) return false;
+    HDC     scr  = GetDC(nullptr);
+    HDC     mem  = CreateCompatibleDC(scr);
+    HBITMAP bmp  = CreateCompatibleBitmap(scr, W, H);
+    HBITMAP oldb = (HBITMAP)SelectObject(mem, bmp);
+    live.paint(mem, W, H);
+    BITMAPINFOHEADER bi = {};
+    bi.biSize = sizeof(bi); bi.biWidth = W; bi.biHeight = H;
+    bi.biPlanes = 1; bi.biBitCount = 24; bi.biCompression = BI_RGB;
+    int rowSize = ((W * 3 + 3) & ~3), imgSize = rowSize * H;
+    std::vector<unsigned char> buf(imgSize);
+    GetDIBits(mem, bmp, 0, H, buf.data(), (BITMAPINFO*)&bi, DIB_RGB_COLORS);
+    BITMAPFILEHEADER fh = {};
+    fh.bfType = 0x4D42; fh.bfOffBits = sizeof(fh) + sizeof(bi); fh.bfSize = fh.bfOffBits + imgSize;
+    std::ofstream f(path, std::ios::binary);
+    bool ok = f.is_open();
+    if (ok) { f.write((char*)&fh, sizeof(fh)); f.write((char*)&bi, sizeof(bi)); f.write((char*)buf.data(), imgSize); }
+    SelectObject(mem, oldb); DeleteObject(bmp); DeleteDC(mem); ReleaseDC(nullptr, scr);
+    return ok;
+}
+
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CHAR:
+            if      (wParam == '1') g_request = 1;   // run the smart light
+            else if (wParam == '2') g_request = 2;   // run the fixed light
+            else if (wParam == 's' || wParam == 'S') {
+                RECT rc; GetClientRect(hwnd, &rc);
+                saveBoardBmp("live_view.bmp", rc.right, rc.bottom);
+            }
+            return 0;
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hwnd, &ps);
+            RECT rc; GetClientRect(hwnd, &rc);
+            HDC mem = CreateCompatibleDC(hdc);
+            HBITMAP bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+            HBITMAP oldBmp = (HBITMAP)SelectObject(mem, bmp);
+            live.paint(mem, rc.right, rc.bottom);
+            BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, oldBmp); DeleteObject(bmp); DeleteDC(mem);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_ERASEBKGND: return 1;
+        case WM_DESTROY:    g_closed = true; PostQuitMessage(0); return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+

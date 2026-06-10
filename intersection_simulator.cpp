@@ -818,3 +818,84 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProcA(hwnd, msg, wParam, lParam);
 }
 
+// guiThreadFunc(): runs the window. It redraws about 30 times a second
+// and reads the keys, until the user closes the window.
+void guiThreadFunc() {
+    WNDCLASSA wc     = {};
+    wc.lpfnWndProc   = WndProc;
+    wc.hInstance     = GetModuleHandle(nullptr);
+    wc.lpszClassName = "IntersectionSimWindow";
+    wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    RegisterClassA(&wc);
+
+    g_hwnd = CreateWindowExA(0, "IntersectionSimWindow",
+                              "Intersection Simulator - Adaptive Traffic Signal",
+                              WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1100, 600,
+                              nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
+    ShowWindow(g_hwnd, SW_SHOW);
+
+    MSG  msg;
+    bool autoShot = false;
+    auto started = Clock::now();
+    while (!g_closed.load()) {
+        while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) { g_closed = true; break; }
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
+        if (g_closed.load()) break;
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+        // Save one picture a few seconds in (good for the report).
+        if (!autoShot && std::chrono::duration<double>(Clock::now() - started).count() > 8.0) {
+            RECT rc; GetClientRect(g_hwnd, &rc);
+            saveBoardBmp("live_view.bmp", rc.right, rc.bottom);
+            autoShot = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(33));
+    }
+}
+#else
+void guiThreadFunc() {}
+#endif
+
+// main
+int main() {
+    log_file.open("results.txt");
+    if (!log_file.is_open())
+        std::cerr << "Warning: cannot open results.txt\n";
+
+    Simulator sim;
+    sim.initialize();
+
+    printLine("=== Intelligent Intersection Simulator v5 (Adaptive Traffic Signal) ===");
+    printLine("Four-way junction, 12 vehicles (4 trucks, 1 ambulance, 7 cars)");
+    printLine("Green light goes to the road that would waste the most fuel.\n");
+    printLine("A live window opened: press [1] = adaptive signal, [2] = fixed signal.\n");
+
+    std::thread gui(guiThreadFunc);
+
+    // Run both modes once to fill results.txt and the screen.
+    // After that the user can replay them with key 1 or 2.
+    SimResult a = sim.runMode(true);    // adaptive
+    SimResult f = sim.runMode(false);   // fixed
+    sim.printStatistics(a, f);
+
+    if (log_file.is_open()) {
+        log_file.close();
+        std::cout << "\nAll output saved to: results.txt\n";
+    }
+    std::cout << "\nLive window is interactive: [1] adaptive, [2] fixed, [S] save image.\n"
+                 "Close the window to exit.\n";
+
+    // Replay loop. It runs until the user closes the window.
+    while (!g_closed.load()) {
+        int req = g_request.exchange(0);
+        if      (req == 1) sim.runMode(true);
+        else if (req == 2) sim.runMode(false);
+        else std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+
+    gui.join();
+    return 0;
+}
